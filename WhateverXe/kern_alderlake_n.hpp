@@ -209,6 +209,22 @@ inline bool value(const DisplayReadout &r, uint32_t offset, uint32_t &out) {
     return false;
 }
 
+// TRANS_DDI_FUNC_CTL2 (0x60404 + transcoder bank) has only two defined fields
+// on Display 13 (Linux v6.12 i915_reg.h):
+//   PORT_SYNC_MODE_ENABLE      = bit 4
+//   PORT_SYNC_MODE_MASTER_SELECT_MASK = bits 2:0
+// Every other bit is reserved/undefined, including bit 3. A GOP may leave
+// reserved bits (e.g. 0x8 on Alder Lake-P/Raptor Lake-P eDP, 0xC0 on Alder
+// Lake-N) set at handoff; Linux ignores them because it reads/writes only the
+// two fields above. Treat the register as idle when no *defined* port-sync
+// field is set, so a reserved-bit remnant cannot reject an otherwise valid
+// single-stream boot source. Port sync itself still rejects: an enabled or
+// master-selected sync transcoder contradicts the uncompressed SST contract
+// proven by dpSource. Callers must keep the observed value in their unchanged
+// checks, so a subsequent real field change is still caught.
+constexpr uint32_t ctl2PortSyncMask {0x17}; // bit4 PORT_SYNC_MODE_ENABLE | bits2:0 MASTER_SELECT
+constexpr bool ctl2Idle(uint32_t ctl2) { return (ctl2 & ctl2PortSyncMask)==0; }
+
 // Source-side certificate for an already-running, uncompressed external SST
 // GOP. This does not prove sink DPCD state, PLL rate or native AUX ownership.
 inline bool dpSource(const DisplayReadout &boot,unsigned pipe,unsigned ddi,const Display13TC::Boot *tc=nullptr,bool panel=false) {
@@ -240,7 +256,7 @@ inline bool dpSource(const DisplayReadout &boot,unsigned pipe,unsigned ddi,const
     // preserve it and include it in the unchanged-source check, never clear it
     // on an enabled transcoder or infer an MST transport from that bit alone.
     return (trans&0xFF000000U)==(0x82000000U|((ddi+1)<<27)) && XELPGeometry::rgbLinkDepth(trans) &&
-        !(trans&((1U<<15)|(1U<<9))) && !ctl2 &&
+        !(trans&((1U<<15)|(1U<<9))) && ctl2Idle(ctl2) &&
         (lanes==1 || lanes==2 || lanes==4) && ((buf>>1)&7)==lanes-1 &&
         (buf&(typeC && tc->ownershipOptional?0x80000080U:0x800000C0U))==
             (typeC && !tc->ownershipOptional?0x80000040U:0x80000000U) &&

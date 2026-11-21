@@ -66,7 +66,7 @@ template<class IO> Result prepare(IO &io,bool admitted,const Wiring &w) {
         if(!(r.active&(1U<<p)))continue;
         if(r.primary==UINT32_MAX)r.primary=p; // same first-active choice as probeBootPipe
         const auto func=get(0x60400+bank),encoding=(func>>27)&15,protocol=(func>>24)&7;
-        if(!encoding || protocol>2 || ((func>>20)&7) || get(0x60404+bank))return r;
+        if(!encoding || protocol>2 || ((func>>20)&7) || !AlderLakeN::ctl2Idle(get(0x60404+bank)))return r;
         const auto d=encoding-1;Port port;
         if(!Port::resolve(d,port) || !(w.selected()&(1U<<d)) || (used&(1U<<d)) ||
            (protocol==2 ? !w.hasDP(d) : !(w.hdmi&(1U<<d))))return r;

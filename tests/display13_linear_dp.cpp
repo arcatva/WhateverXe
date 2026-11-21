@@ -66,6 +66,23 @@ int main() {
             assert(r.status==LinearStatus::StateChanged && !r.restored && r.writes==(tick==1?0U:tick==3?2U:10U));
         }
     }
+    // TRANS_DDI_FUNC_CTL2 reserved bits (incl. bit3, seen as 0x8 on ADL-P /
+    // RPL-P eDP and 0xC0 on ADL-N) are undefined in Linux v6.12 i915 and must
+    // not reject an SST boot source; only the defined port-sync fields do.
+    // A reserved-bit remnant still participates in dpSourceUnchanged drift.
+    for(uint32_t reserved:{0x8U,0xC0U,0xC8U}) {
+        auto io=firmware(0,0,4,true);io.regs[0x60404]=reserved;
+        auto boot=readDisplay(io,true);LinearPlan plan;
+        assert(dpSource(boot,0,0) && linearPlan(boot,plan,0,GOPProtocol::DP)==LinearStatus::Ready);
+        auto r=reinitializeLinear(io,boot,true,0,GOPProtocol::DP);
+        assert(r.status==LinearStatus::Success && dpSourceUnchanged(io,boot,0,0));
+    }
+    for(uint32_t sync:{0x10U,0x1U,0x7U,0x18U}) { // bit4 enable / bits2:0 master select, even with bit3 set
+        auto io=firmware(0,0,4,true);io.regs[0x60404]=sync;
+        auto boot=readDisplay(io,true);LinearPlan plan;
+        assert(!ctl2Idle(sync) && !dpSource(boot,0,0));
+        assert(linearPlan(boot,plan,0,GOPProtocol::DP)==LinearStatus::InvalidDPSource);
+    }
     for(unsigned ddi=0;ddi<2;++ddi)for(unsigned pipe=0;pipe<3;++pipe)for(unsigned sr=0;sr<2;++sr)for(unsigned depth:{0U,1U,2U,3U}) {
         auto io=firmware(pipe,ddi,2,true);io.regs[0x60400+pipe*0x1000]|=depth<<20;io.regs[0x60540+0x1000*pipe]|=sr<<6;
         auto boot=readDisplay(io,true);LinearPlan plan;

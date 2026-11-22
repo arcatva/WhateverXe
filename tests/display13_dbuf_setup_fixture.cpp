@@ -49,6 +49,7 @@ static bool badBinding,failPrimary,failWM;static unsigned armCalls;static Displa
 static std::map<unsigned,std::vector<uint64_t>> records;
 struct IORegistryEntry {static IORegistryEntry *getRegistryRoot(){static IORegistryEntry root;return &root;}void setProperty(const char*,void*,unsigned){}};
 void adlnFault(bool &f,unsigned,unsigned=0){f=true;}
+void adlnTraceLineTime(unsigned,unsigned,uint64_t,uint32_t,uint64_t,uint32_t,uint32_t,IOService*,OSObject*,uint64_t){} // Diagnostic branch only.
 void adlnPublishMemory(const char *name,unsigned p,void *data,unsigned bytes,bool=false){
  if(!strcmp(name,"N97FBDBUFLayout"))records[p]=std::vector<uint64_t>((uint64_t*)data,(uint64_t*)data+bytes/8);
 }

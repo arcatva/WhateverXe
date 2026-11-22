@@ -9574,6 +9574,38 @@ void XE::adlnWMSetup(OSObject *plane,OSObject *path,bool cursor) {
 void XE::wrapAlderLakeNPlaneWMSetup(OSObject *plane,OSObject *path) {adlnWMSetup(plane,path,false);}
 void XE::wrapDisplay13CursorWMSetup(OSObject *plane,OSObject *path) {adlnWMSetup(plane,path,true);}
 
+// DIAGNOSTIC BRANCH ONLY (acer-linetime-trace), not for the base: order of
+// pipe line-time calculations (kind 1) and latch proofs (kind 2) with the
+// native rate routine's three forms, the path CRTC's line-time field
+// (path+0x1AC, which native enablePipe/enablePipeWatermarks/hwSetMode/
+// hwSetStream/hwUpdateUnderscan copy to PIPE_WM_LINETIME) and the register.
+// Keeps the first 40 events and the last 8. Caller holds the owner lock.
+static void adlnTraceLineTime(unsigned kind,unsigned pipe,uint64_t detail,uint32_t htotal,uint64_t usedHz,uint32_t value,
+                              uint32_t before,IOService *fb,OSObject *path,uint64_t routine) {
+	static uint64_t events[48][10];static uint64_t count[1];static uint64_t previous[4];
+	auto &c=display13FBPower;
+	if(pipe>=3 || !fb || !path || !routine)return;
+	auto adjust=reinterpret_cast<uint64_t (*)(void *,void *,void *,bool,void *)>(routine);
+	const auto pathHz=adjust(c.controller,fb,path,true,reinterpret_cast<uint8_t *>(path)+0x128);
+	const auto nullHz=adjust(c.controller,fb,path,true,nullptr);
+	const uint64_t held=Display13FBMemory::field<uint32_t>(path,0x1AC);
+	uint64_t wells=UINT32_MAX,reg=UINT32_MAX;
+	if(c.map) {
+		Display13FBDBUFIO io {c.map};wells=io.read(0x45404);
+		if(Display13FBIRQ::powered(static_cast<uint32_t>(wells),pipe))reg=io.read(0x45270+4*pipe);
+	}
+	const uint64_t now[4] {held,reg,nullHz,pathHz|(detail<<40)};
+	if(kind!=1 && count[0] && !memcmp(now,previous,sizeof(now)))return;
+	memcpy(previous,now,sizeof(now));
+	uint64_t t=0,ns=0;clock_get_uptime(&t);absolutetime_to_nanoseconds(t,&ns);
+	auto &e=events[count[0]<40 ? count[0] : 40+(count[0]-40)%8];
+	e[0]=kind|(count[0]<<8)|(uint64_t(pipe)<<56);e[1]=ns/1000000;e[2]=detail;e[3]=htotal;e[4]=usedHz;e[5]=pathHz;e[6]=nullHz;
+	e[7]=value;e[8]=held|(uint64_t(before)<<32);e[9]=reg|(wells<<32);
+	++count[0];
+	auto root=IORegistryEntry::getRegistryRoot();
+	root->setProperty("N97FBLineTimeTrace",events,sizeof(events));
+	root->setProperty("N97FBLineTimeTraceCount",count,sizeof(count));
+}
 void XE::wrapAlderLakeNPipeWMSetup(IOService *controller,IOService *fb,OSObject *path,void *params) {
 	auto &c=display13FBPower;if(!c.lock)return;
 	uint64_t record[8] {};IOLockLock(c.lock);
@@ -9599,7 +9631,9 @@ void XE::wrapAlderLakeNPipeWMSetup(IOService *controller,IOService *fb,OSObject 
 		auto adjust=reinterpret_cast<uint64_t (*)(void *,void *,void *,bool,void *)>(callbackXE->adlnAdjustPixelClock);
 		const auto pixel=adjust(controller,fb,path,true,crtc);
 		const auto value=Display13WM::pipeLineTime(htotal,pixel);
+		const auto heldBefore=Display13FBMemory::field<uint32_t>(path,0x1AC);
 		*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(crtc)+0x84)=value;
+		adlnTraceLineTime(1,Display13FBMemory::field<uint32_t>(path,0x3640),params!=nullptr,htotal,pixel,value,heldBefore,fb,path,callbackXE->adlnAdjustPixelClock);
 		// With a CRTC this rate carries no pipe-scaler downscale, unlike the
 		// null form the latch proof reads later. Keep what is programmed.
 		c.pipe[Display13FBMemory::field<uint32_t>(path,0x3640)].pipeTiming={htotal,value,pixel};
@@ -9822,8 +9856,13 @@ Display13WM::Latch XE::adlnVerifyWMLatch(IOService *fb,uint64_t nativeHz,uint64_
 		c.pipe[pipe].wmSurface[0],c.pipe[pipe].wmSurface[1],readout.read(0x45004),nativeHz,c.pipe[pipe].wm0Only[0],cursor,
 		Display13WM::pipeLineTime(c.pipe[pipe].wm[0].htotal,timingHz),pipePixel,pipe,c.transcoders,timingHz
 	};
-	if(!Display13WM::clockFits(expected,targetHz)) {result.status=Display13WM::Status::Input;return result;}
-	return Display13WM::latch(io,expected);
+	if(!Display13WM::clockFits(expected,targetHz)) {
+		adlnTraceLineTime(2,pipe,static_cast<uint32_t>(Display13WM::Status::Input),c.pipe[pipe].wm[0].htotal,timingHz,expected.pipeLineTime,0,fb,path,callbackXE->adlnAdjustPixelClock);
+		result.status=Display13WM::Status::Input;return result;
+	}
+	const auto proof=Display13WM::latch(io,expected);
+	adlnTraceLineTime(2,pipe,static_cast<uint32_t>(proof.status),c.pipe[pipe].wm[0].htotal,timingHz,expected.pipeLineTime,0,fb,path,callbackXE->adlnAdjustPixelClock);
+	return proof;
 }
 
 // Called under the existing native FB mutex and display owner lock only

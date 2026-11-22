@@ -9095,7 +9095,12 @@ IOMemoryDescriptor *XE::wrapAlderLakeNAperture(IOService *fb,int apertureIndex) 
 			uint64_t record[] {1,f[0x1E0],Display13FBMemory::field<uint8_t>(fb,0x4288),Display13FBMemory::field<uint32_t>(c.controller,0xDF0),base,bytes,
 				backing,c.pipe[pipe].memory.pool.state,c.pipe[pipe].memory.pool.pages};
 			adlnPublishMemory("N97FBApertureFirstFailure",pipe,record,sizeof(record),true);
-			adlnFault(c.memoryFaulted,__LINE__);
+			// IOGraphics may request a subrange that is not page aligned; no
+			// aperture can satisfy it, so rejecting it says nothing about the
+			// hardware. Latching memoryFaulted here would poison every later
+			// allocate/setup on this boot. Only a satisfiable request is a fault.
+			const bool aligned=bytes && !(base&4095) && !(bytes&4095);
+			if(aligned)adlnFault(c.memoryFaulted,__LINE__);
 		}
 	}
 	IOLockUnlock(c.lock);

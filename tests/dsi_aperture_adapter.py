@@ -53,7 +53,28 @@ int main(){
   assert(!xe.wrapAlderLakeNAperture(&fb,0) && !depth && parent.refs==1);
   assert(c.memoryFaulted==(problem>=2));
  }
- puts("PASS production DSI aperture: zero unpublished range before/after private surface stays unavailable; invalid nonzero/backing/target/stop still faults");
+ // Non-DSI contract. Basis: IOGraphics requests exactly width*height*4 bytes; on an ADL-P eDP panel whose
+ // startup mode was 2880x1620 that is 0x11CC400, not a whole number of pages. Such a request cannot be
+ // satisfied (the wrapper still returns null) but must not latch memoryFaulted, which refuses every later
+ // allocation and flip on that boot. Counterexamples that must keep faulting: a length that does not fit
+ // the pool even after rounding, an unaligned base, and backing that no longer matches the pool.
+ for(unsigned kind=0;kind<5;++kind){IOService fb,controller,parent;IOLock lock;XE xe;xe.adlnOutputWiring.dsi=0;callbackXE=&xe;
+  display13FBPower={};auto &c=display13FBPower;c.lock=&lock;c.controller=&controller;c.pipe[0].memoryFramebuffer=&fb;
+  put(&fb,0x1E0,uint8_t(1));put(&fb,0x4288,uint8_t(0));put(&controller,0xDF0,1U);
+  put(&controller,0xDF4,uint8_t(1));put(&controller,0xDF5,uint8_t(3));put(&controller,0x1A10,1U);
+  put(&controller,0x1A28,uint64_t(0x80000000));put(&controller,0x1A30,0x800000U);put(&controller,0x1A34,0x800U);
+  put(&controller,0xC80,&parent);c.pipe[0].memory.pool=pool(&controller);pending=false;target=false;
+  bool fault=true;
+  switch(kind){
+   case 0:put(&fb,0x4314,0x1CC400U);fault=false;break;
+   case 1:put(&fb,0x4314,0x7FF400U);fault=false;break;
+   case 2:put(&fb,0x4314,0x800400U);break;
+   case 3:put(&fb,0x4314,0x1CC400U);put(&fb,0x4330,0x800U);break;
+   case 4:put(&fb,0x4314,0x1CC400U);c.pipe[0].memory.pool.pages++;break;}
+  assert(!xe.wrapAlderLakeNAperture(&fb,0) && !depth && parent.refs==1);
+  assert(c.memoryFaulted==fault);
+ }
+ puts("PASS production aperture: DSI zero unpublished range stays unavailable and invalid nonzero/backing/target/stop still faults; non-DSI page-unaligned length is rejected without a latched fault while out-of-pool, unaligned-base and lost-backing requests still fault");
 }
 '''.replace('BODY',body)
 with tempfile.TemporaryDirectory(prefix='dsi-aperture-') as directory:

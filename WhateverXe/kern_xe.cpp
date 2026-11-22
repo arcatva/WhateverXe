@@ -9089,18 +9089,23 @@ IOMemoryDescriptor *XE::wrapAlderLakeNAperture(IOService *fb,int apertureIndex) 
 		   dsiModeTarget(fb) && !callbackXE->dsiStopAttempted) {
 			IOLockUnlock(c.lock);return nullptr;
 		}
+		// IOGraphics asks for exactly width x height x 4 bytes. On a non-DSI
+		// output a request that is valid in every other respect but is not a
+		// whole number of pages (2880x1620 is 0x11CC400 bytes) cannot be
+		// satisfied, yet it says nothing about the hardware or the backing.
+		// Reject it without latching memoryFaulted, which would refuse every
+		// later allocation and flip on this boot. All other failures, and
+		// every DSI case, keep the fault path below.
+		const bool unalignedLength=parent && backing && !callbackXE->adlnOutputWiring.dsi &&
+			(bytes&4095) && bytes<=0xFFFFF000U &&
+			Display13FBMemory::apertureRange(c.pipe[pipe].memory.pool,base,(bytes+4095)&~4095U,parent->getLength());
 		if(!parent || !backing ||
 			!Display13FBMemory::apertureRange(c.pipe[pipe].memory.pool,base,bytes,parent->getLength()))parent=nullptr;
 		if(parent)parent->retain();else {
 			uint64_t record[] {1,f[0x1E0],Display13FBMemory::field<uint8_t>(fb,0x4288),Display13FBMemory::field<uint32_t>(c.controller,0xDF0),base,bytes,
 				backing,c.pipe[pipe].memory.pool.state,c.pipe[pipe].memory.pool.pages};
 			adlnPublishMemory("N97FBApertureFirstFailure",pipe,record,sizeof(record),true);
-			// IOGraphics may request a subrange that is not page aligned; no
-			// aperture can satisfy it, so rejecting it says nothing about the
-			// hardware. Latching memoryFaulted here would poison every later
-			// allocate/setup on this boot. Only a satisfiable request is a fault.
-			const bool aligned=bytes && !(base&4095) && !(bytes&4095);
-			if(aligned)adlnFault(c.memoryFaulted,__LINE__);
+			if(!unalignedLength)adlnFault(c.memoryFaulted,__LINE__);
 		}
 	}
 	IOLockUnlock(c.lock);

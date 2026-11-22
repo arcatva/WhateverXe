@@ -4676,8 +4676,8 @@ struct Display13FBPipeContext {
     Display13WM::Latch wmLatch;
     uint32_t wmPending {},wmSurface[2] {};
     bool wm0Only[2] {};
-    // Line time the pipe calculation last produced for this pipe; the latch
-    // proof checks PIPE_WM_LINETIME against it, not against the downscaled rate.
+    // Line time the pipe calculation last produced for this pipe. The owner
+    // programs it before the latch proof, which checks PIPE_WM_LINETIME against it.
     Display13WM::PipeTiming pipeTiming;
     // Zero until a real surface/WM retirement at the current display clock.
     uint64_t watermarkClockHz {};
@@ -9600,8 +9600,9 @@ void XE::wrapAlderLakeNPipeWMSetup(IOService *controller,IOService *fb,OSObject 
 		const auto pixel=adjust(controller,fb,path,true,crtc);
 		const auto value=Display13WM::pipeLineTime(htotal,pixel);
 		*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(crtc)+0x84)=value;
-		// With a CRTC this rate carries no pipe-scaler downscale, unlike the
-		// null form the latch proof reads later. Keep what is programmed.
+		// The rate carries a pipe-scaler downscale only when that scaler is
+		// already in effect here. Keep the result: the latch proof expects it
+		// and adlnProgramPipeLineTime programs it where the native path does not.
 		c.pipe[Display13FBMemory::field<uint32_t>(path,0x3640)].pipeTiming={htotal,value,pixel};
 		if(!value)adlnFault(c.watermarkFaulted,__LINE__);
 		record[1]=value;record[2]=htotal;record[3]=pixel;record[4]=params!=nullptr;
@@ -9623,6 +9624,39 @@ static bool adlnWriterMappingBound() {
 	return native && c.map->getVirtualAddress() &&
 		Display13WM::writerMapping(Display13FBMemory::field<uintptr_t>(c.access,0x50),native->getVirtualAddress(),
 			native->getPhysicalAddress(),native->getLength(),c.map->getPhysicalAddress(),c.map->getLength());
+}
+
+// The native plane-only partial modeset recalculates the pipe line time (path
+// CRTC +0x84) without programming PIPE_WM_LINETIME. A boot directly into a
+// downscaled mode therefore kept the firmware's 0x59 against a calculated 0x3E
+// and the latch proof faulted on its first transaction. Program the value that
+// proof will expect, through the native writer, before the flush it follows.
+// Caller holds the native framebuffer mutex and the owner lock, has bound the
+// writer mapping and found the pipe powered.
+__attribute__((noinline)) static Display13WM::Program adlnProgramPipeLineTime(IOService *fb,OSObject *path,unsigned pipe,
+                                                                             mach_vm_address_t rate,mach_vm_address_t writer) {
+	auto &c=display13FBPower;Display13WM::Program r;
+	if(pipe>=3 || !fb || !path || path->getMetaClass()->getClassSize()<0x3730 || !rate || !writer || !c.map || !c.access)return r;
+	const auto &p=c.pipe[pipe].wm[0];
+	auto scaler=Display13FBMemory::field<OSObject *>(path,0x32C0);
+	if(p.status!=Display13WM::Status::Complete || !scaler || scaler->getMetaClass()->getClassSize()<0x58 ||
+		static_cast<OSObject *>(c.access)->getMetaClass()->getClassSize()<0x68 ||
+		Display13FBMemory::field<uint32_t>(c.access,0x60)!=0x1000000 ||
+		Display13FBMemory::field<uintptr_t>(Display13FBMemory::field<void *>(c.access,0),0x130)!=writer)return r;
+	struct IO {
+		IOMemoryMap *map;void *access;mach_vm_address_t writer;
+		bool readable(uint32_t reg) const {return map && map->getLength()==0x1000000 && map->getVirtualAddress() && !(reg&3) && reg<=0xFFFFFC;}
+		uint32_t read(uint32_t reg) const {return *reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress()+reg);}
+		void write(uint32_t reg,uint32_t value) {reinterpret_cast<void (*)(void *,uint64_t,uint32_t)>(writer)(access,reg,value);}
+	} io {c.map,c.access,writer};
+	const auto pipePixel=reinterpret_cast<uint64_t (*)(void *,void *,void *,bool,void *)>(rate)(c.controller,fb,path,true,nullptr);
+	r=Display13WM::programLineTime(io,pipe,
+		Display13WM::pipeLineTime(p.htotal,Display13WM::pipeTimingHz(c.pipe[pipe].pipeTiming,p.htotal,pipePixel)));
+	if(r.writes || r.status!=Display13WM::Status::Complete) {
+		uint64_t record[8] {1,static_cast<uint32_t>(r.status),r.writes,r.lastReg,r.expected,r.observed,pipePixel,c.pipe[pipe].pipeTiming.hz};
+		adlnPublishMemory("N97FBPipeLineTimeProgram",pipe,record,sizeof(record));
+	}
+	return r;
 }
 
 
@@ -9814,8 +9848,9 @@ Display13WM::Latch XE::adlnVerifyWMLatch(IOService *fb,uint64_t nativeHz,uint64_
     const auto primaryRaw=Display13DBUF::hardwareRaw(c.dbuf,pipe,c.dbuf.pipe[pipe].primary);
     const auto cursorRaw=Display13DBUF::hardwareRaw(c.dbuf,pipe,c.dbuf.pipe[pipe].cursor);
     if(primaryRaw==UINT32_MAX || cursorRaw==UINT32_MAX) {result.status=Display13WM::Status::Input;return result;}
-	// pipePixel includes a pipe-scaler downscale; the programmed line time
-	// does not. Expect the value wrapAlderLakeNPipeWMSetup produced.
+	// pipePixel includes a pipe-scaler downscale; the calculated line time may
+	// predate it. Expect the value wrapAlderLakeNPipeWMSetup produced, which
+	// adlnProgramPipeLineTime programmed before the flush.
 	const auto timingHz=Display13WM::pipeTimingHz(c.pipe[pipe].pipeTiming,c.pipe[pipe].wm[0].htotal,pipePixel);
 	const Display13WM::Snapshot expected {
 		&c.pipe[pipe].wm[0],&c.pipe[pipe].wm[1],primaryRaw,cursorRaw,
@@ -9945,6 +9980,9 @@ void XE::display13WMArmUpdate(IOService *fb) {
 				directCursor[13]=Display13FBMemory::field<uint32_t>(path,0x170);
 				intent=Display13WM::triggerSurfaces(reinterpret_cast<const Display13WM::TriggerPacket *>(
 					reinterpret_cast<uint8_t *>(path)+0x32F0),packetCount,c.pipe[pipe].wmSurface[0],cursorBaseline,pipe);
+				// DSI owns its line time through its own surface programming.
+				if(owner && Display13FBIRQ::powered(wells,pipe) && !dsiModeTarget(fb))
+					adlnProgramPipeLineTime(fb,path,pipe,callbackXE->adlnAdjustPixelClock,callbackXE->adlnWMWrite32);
 			}
 			trigger[1]=associated;trigger[2]=intent.valid;trigger[3]=packetCount;
 			trigger[4]=c.pipe[pipe].wmSurface[0];trigger[5]=c.pipe[pipe].wmSurface[1];

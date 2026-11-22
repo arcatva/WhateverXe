@@ -339,13 +339,14 @@ int main() {
     assert(latch(oldLineTime,oldLineTime.snapshot(p)).status==Status::Readback && !oldLineTime.elapsed);
     LatchIO missingLineTime(p);missingLineTime.regs.erase(0x45270);
     assert(latch(missingLineTime,missingLineTime.snapshot(p)).status==Status::Unavailable && !missingLineTime.elapsed);
-    // Pipe-scaler downscale. Contract and basis: PIPE_WM_LINETIME and the frame period follow the transcoder
-    // clock; plane watermarks and display-clock bandwidth follow the downscaled rate. ADL-P eDP 2560x1440
-    // (2720x1504 total, 245.5MHz) scanning a 2880x1620 source: the pipe calculation programs 89 (0x59), the
-    // register reads 89, and the plane/pipe rate is 310710937Hz, whose own line time would be 71 (0x47).
-    // Counterexamples that must fail: 71 in the register, a proof without the writer's record against 89, a
-    // snapshot whose line time is not its timing rate's, a timing rate above the pipe rate or a ninth of it
-    // or less, and a display clock too slow for the downscaled rate.
+    // Pipe-scaler downscale. Contract and basis: the proof expects the line time the pipe calculation last
+    // produced, which need not be the one of the rate at proof time; plane watermarks and display-clock
+    // bandwidth follow the downscaled rate. ADL-P eDP 2560x1440 (2720x1504 total, 245.5MHz) entering a
+    // 2880x1620 source from its native mode: the calculation ran before the scaler took effect and produced
+    // 89 (0x59), the native underscan path programmed 89, and the plane/pipe rate is 310710937Hz, whose own
+    // line time would be 71 (0x47). Counterexamples that must fail: 71 in the register, a proof without the
+    // calculation's record against 89, a snapshot whose line time is not its timing rate's, a timing rate
+    // above the pipe rate or a ninth of it or less, and a display clock too slow for the downscaled rate.
     {
         const PipeTiming none {},kept {2720,89,245500000},wrongValue {2720,71,245500000};
         assert(pipeLineTime(2720,245500000)==89 && pipeLineTime(2720,310710937)==71 && pipeLineTime(2720,353520000)==62);
@@ -380,6 +381,65 @@ int main() {
         assert(!clockFits(above,1305600000));
         auto far=s;far.pipePixelHz=2209499999ULL;assert(clockFits(far,4419000000ULL));
         far.pipePixelHz=2209500000ULL;assert(!clockFits(far,4419000000ULL));
+    }
+    // Owner programming of PIPE_WM_LINETIME. Contract and basis: the native plane-only partial modeset
+    // recalculates the line time without programming it, so the owner programs the proof's expectation first.
+    // Same panel booted directly into a 3072x1728 source: the calculation produced 62 (0x3E, 353516853Hz)
+    // while the register still held the firmware's 89, and the proof read back 89 against 62. Required: an
+    // unequal register is written once through the supplied writer and read back, an equal one is not
+    // written, each pipe uses its own register (4-byte stride) and power well. Counterexamples: a write that
+    // does not stick, an unpowered pipe, an unreadable or all-ones register, an invalid pipe and a value
+    // outside the nine-bit field must not report completion; none of them may touch another register.
+    {
+        DisplayIO equal(false);equal.regs[0x45270]=62;
+        const auto kept=programLineTime(equal,0,62);
+        assert(kept.status==Status::Complete && !kept.writes && kept.readbacks==1 && equal.writes.empty());
+        DisplayIO firmware(false);firmware.regs[0x45270]=89;
+        const auto programmed=programLineTime(firmware,0,62);
+        assert(programmed.status==Status::Complete && programmed.writes==1 && programmed.readbacks==2 &&
+            programmed.lastReg==0x45270 && programmed.expected==62 && programmed.observed==62 &&
+            firmware.regs[0x45270]==62 && firmware.writes==std::vector<uint32_t>{0x45270});
+        DisplayIO stuck(false);stuck.regs[0x45270]=89;stuck.drop=0x45270;
+        const auto dropped=programLineTime(stuck,0,62);
+        assert(dropped.status==Status::Readback && dropped.writes==1 && dropped.expected==62 && dropped.observed==89);
+        DisplayIO unpowered(false);unpowered.regs[0x45270]=89;unpowered.regs[0x45404]=3;
+        assert(programLineTime(unpowered,0,62).status==Status::Power && unpowered.writes.empty() && unpowered.regs[0x45270]==89);
+        DisplayIO absent(false);
+        assert(programLineTime(absent,0,62).status==Status::Unavailable && absent.writes.empty());
+        DisplayIO floating(false);floating.regs[0x45270]=UINT32_MAX;
+        assert(programLineTime(floating,0,62).status==Status::Readback && floating.writes.empty());
+        for(auto value:{0U,512U,UINT32_MAX}) {
+            DisplayIO bad(false);bad.regs[0x45270]=89;
+            assert(programLineTime(bad,0,value).status==Status::Input && bad.writes.empty() && bad.reads.empty());
+        }
+        for(auto pipe:{3U,UINT32_MAX}) {
+            DisplayIO bad(false);bad.regs[0x45270]=89;
+            assert(programLineTime(bad,pipe,62).status==Status::Input && bad.writes.empty() && bad.reads.empty());
+        }
+        for(unsigned pipe=0;pipe<3;++pipe) {
+            DisplayIO banks(false);banks.regs[0x45404]=0xFC0F;
+            for(unsigned other=0;other<3;++other)banks.regs[0x45270+4*other]=89;
+            assert(programLineTime(banks,pipe,62).status==Status::Complete && banks.writes==std::vector<uint32_t>{0x45270+4*pipe});
+            for(unsigned other=0;other<3;++other)assert(banks.regs[0x45270+4*other]==(other==pipe ? 62U : 89U));
+            banks.regs[0x45404]&=~(1U<<(10+2*pipe));banks.writes.clear();
+            assert(programLineTime(banks,pipe,71).status==Status::Power && banks.writes.empty());
+        }
+        // The observed boot, at the proof: 89 fails, and passes once the owner has programmed 62.
+        auto bp=plan(3072,2720,353516853,2008,latency,true,false,1728);
+        assert(bp.status==Status::Complete && bp.sagv.enable);
+        LatchIO boot(bp);boot.clock=1305600000;
+        boot.regs[0x60000]=(2719U<<16)|2559;boot.regs[0x6000C]=(1503U<<16)|1439;
+        boot.regs[0x70190]=(1727U<<16)|3071;boot.regs[0x45270]=89;
+        const PipeTiming calculated {2720,62,353516853};
+        auto expected=boot.snapshot(bp);
+        expected.pipeTimingHz=pipeTimingHz(calculated,bp.htotal,bp.pixelHz);
+        expected.pipeLineTime=pipeLineTime(bp.htotal,expected.pipeTimingHz);
+        assert(expected.pipeTimingHz==353516853 && expected.pipeLineTime==62);
+        const auto before=latch(boot,expected);
+        assert(before.status==Status::Readback && before.lastReg==0x45270 && before.expected==62 && before.observed==89 && !boot.elapsed);
+        assert(programLineTime(boot,0,expected.pipeLineTime).status==Status::Complete && boot.writes==std::vector<uint32_t>{0x45270});
+        boot.writes.clear();
+        assert(latch(boot,expected).status==Status::Complete && boot.writes.empty());
     }
     LatchIO clockChanged(p);clockChanged.changeClock=true;
     assert(latch(clockChanged,clockChanged.snapshot(p)).status==Status::Conflict);

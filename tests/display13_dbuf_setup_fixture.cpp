@@ -182,18 +182,19 @@ int main(){
   XE::adlnSetupDBUFPipe(c.controller,(IOService*)fb[0],0,false);assert(c.dbuf.faulted);
  }
  // PIPE_WM_LINETIME, production pipe calculation to the latch proof's input.
- // Contract and basis: the pipe calculation passes a CRTC to the native rate
- // routine and programs the transcoder's own line time. On an ADL-P eDP
- // 2560x1440 panel (htotal 2720, 245.5MHz) scanning a 2880x1620 source it
- // recorded 0x59 and PIPE_WM_LINETIME read back 0x59, while the null-CRTC
- // form the latch proof calls returned the downscaled 310710937Hz, i.e.
- // 0x47, and the proof faulted on a value that scans out without underrun.
- // The proof therefore takes its line time from what this writer kept.
+ // Contract and basis: the proof expects the line time the pipe calculation
+ // last produced for that pipe. On an ADL-P eDP 2560x1440 panel (htotal 2720,
+ // 245.5MHz) entering a 2880x1620 source from its native mode the calculation
+ // ran before the scaler took effect and produced 0x59, which the native
+ // underscan path programmed; by the time of the proof the native rate routine
+ // returned the downscaled 310710937Hz, i.e. 0x47, and a proof recomputing
+ // from that rate faulted on a value that scans out without underrun.
  // Counterexamples: the pending CRTC, not the path's, decides when supplied;
  // only the path's own pipe is recorded; a record for another htotal, above
  // the pipe rate, or nine times below it leaves the unscaled rule in force.
  // Limits: adlnVerifyWMLatch itself is not executed here; the rate routine
- // is modeled from those two observed returns.
+ // is a model that returns the earlier rate to the calculation's call (which
+ // passes a CRTC) and the later, downscaled one to a call without a CRTC.
  {
   static unsigned crtcCalls,nullCalls;
   struct Rate {static uint64_t adjust(void*,void*,void*,bool pipe,void *crtc){assert(pipe);++(crtc?crtcCalls:nullCalls);return crtc?245500000:310710937;}};

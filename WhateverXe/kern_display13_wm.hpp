@@ -240,12 +240,33 @@ template<class IO> Program program(IO &io,const Plan &p,bool cursor,bool wm0Only
     }
     r.status=Status::Complete;return r;
 }
-// The pipe calculation derives PIPE_WM_LINETIME from the transcoder's own
-// pixel clock. A pipe-scaler downscale raises the rate the planes and the
-// display clock must carry, but not that register: an ADL-P eDP 2560x1440
-// panel (htotal 2720, 245.5MHz) scanning a 2880x1620 or 3072x1728 source
-// holds 0x59 while its downscaled pipe rate is 310.7 or 353.5MHz. This is
-// what the pipe calculation last produced for one pipe.
+// PIPE_WM_LINETIME is not double buffered and no trigger arms it. The native
+// plane-only partial modeset recalculates the pipe line time without
+// programming it; only the native pipe enable, mode, stream and underscan
+// paths copy the calculated value. The owner therefore programs the value its
+// latch proof expects before that proof. An equal register is left alone.
+template<class IO> Program programLineTime(IO &io,unsigned pipeIndex,uint32_t value) {
+    Program r;
+    if(pipeIndex>=3 || !value || value>511) {r.status=Status::Input;return r;}
+    const uint32_t reg=0x45270+4*pipeIndex;
+    if(!io.readable(0x45404) || !io.readable(reg))return r;
+    if(!Display13FBIRQ::powered(io.read(0x45404),pipeIndex)) {r.status=Status::Power;return r;}
+    r.lastReg=reg;r.expected=value;r.observed=io.read(reg);++r.readbacks;
+    if(r.observed==UINT32_MAX) {r.status=Status::Readback;return r;}
+    if(r.observed!=value) {
+        io.write(reg,value);++r.writes;
+        r.observed=io.read(reg);++r.readbacks;
+        if(r.observed!=value) {r.status=Status::Readback;return r;}
+    }
+    r.status=Status::Complete;return r;
+}
+// What the pipe calculation last produced for one pipe. The native rate
+// routine includes a pipe-scaler downscale only when that scaler is already
+// in effect as it runs, so the result depends on the path taken: an ADL-P eDP
+// 2560x1440 panel (htotal 2720, 245.5MHz) entering a 3072x1728 source from its
+// native mode calculates 0x59, between two downscaled sources 0x47 or 0x3E,
+// and booting directly into one 0x3E. The latch proof expects this value, not
+// one recomputed from the rate at proof time.
 struct PipeTiming {
     uint32_t htotal {},lineTime {};
     uint64_t hz {};

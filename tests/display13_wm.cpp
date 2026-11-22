@@ -339,6 +339,48 @@ int main() {
     assert(latch(oldLineTime,oldLineTime.snapshot(p)).status==Status::Readback && !oldLineTime.elapsed);
     LatchIO missingLineTime(p);missingLineTime.regs.erase(0x45270);
     assert(latch(missingLineTime,missingLineTime.snapshot(p)).status==Status::Unavailable && !missingLineTime.elapsed);
+    // Pipe-scaler downscale. Contract and basis: PIPE_WM_LINETIME and the frame period follow the transcoder
+    // clock; plane watermarks and display-clock bandwidth follow the downscaled rate. ADL-P eDP 2560x1440
+    // (2720x1504 total, 245.5MHz) scanning a 2880x1620 source: the pipe calculation programs 89 (0x59), the
+    // register reads 89, and the plane/pipe rate is 310710937Hz, whose own line time would be 71 (0x47).
+    // Counterexamples that must fail: 71 in the register, a proof without the writer's record against 89, a
+    // snapshot whose line time is not its timing rate's, a timing rate above the pipe rate or a ninth of it
+    // or less, and a display clock too slow for the downscaled rate.
+    {
+        const PipeTiming none {},kept {2720,89,245500000},wrongValue {2720,71,245500000};
+        assert(pipeLineTime(2720,245500000)==89 && pipeLineTime(2720,310710937)==71 && pipeLineTime(2720,353520000)==62);
+        assert(pipeTimingHz(kept,2720,310710937)==245500000 && pipeTimingHz(kept,2720,353520000)==245500000);
+        assert(pipeTimingHz(kept,2720,245500000)==245500000); // No downscale: one rate.
+        assert(pipeTimingHz(none,2720,310710937)==310710937 && pipeTimingHz(wrongValue,2720,310710937)==310710937);
+        assert(pipeTimingHz(kept,2200,310710937)==310710937 && pipeTimingHz(kept,2720,245499999)==245499999);
+        assert(pipeTimingHz(kept,2720,2209499999ULL)==245500000 && pipeTimingHz(kept,2720,2209500000ULL)==2209500000ULL);
+        auto dp=plan(2880,2720,310710937,2008,latency,true,false,1620);
+        assert(dp.status==Status::Complete && dp.sagv.enable);
+        auto downscaled=[&](uint32_t lineTimeRegister) {
+            LatchIO io(dp);io.clock=1305600000;
+            io.regs[0x60000]=(2719U<<16)|2559;io.regs[0x6000C]=(1503U<<16)|1439;
+            io.regs[0x70190]=(1619U<<16)|2879;io.regs[0x45270]=lineTimeRegister;
+            return io;
+        };
+        auto good=downscaled(89);auto s=good.snapshot(dp);
+        s.pipeTimingHz=pipeTimingHz(kept,dp.htotal,dp.pixelHz);s.pipeLineTime=pipeLineTime(dp.htotal,s.pipeTimingHz);
+        assert(s.pipePixelHz==310710937 && s.pipeTimingHz==245500000 && s.pipeLineTime==89);
+        const auto proof=latch(good,s);
+        // 2720*1504 pixels at 245.5MHz: ceil(16663.46us)=16664, budget 3*16664+1000.
+        assert(proof.status==Status::Complete && proof.waitUs==2000 && proof.budgetUs==50992 && good.writes.empty());
+        auto linuxValue=downscaled(71);const auto wrongRegister=latch(linuxValue,s);
+        assert(wrongRegister.status==Status::Readback && wrongRegister.lastReg==0x45270 &&
+            wrongRegister.expected==89 && wrongRegister.observed==71 && !linuxValue.elapsed);
+        auto unrecorded=downscaled(89);const auto noRecord=latch(unrecorded,unrecorded.snapshot(dp));
+        assert(noRecord.status==Status::Readback && noRecord.lastReg==0x45270 && noRecord.expected==71 && noRecord.observed==89);
+        auto inconsistent=s;inconsistent.pipeLineTime=71;auto unread=downscaled(71);
+        assert(!clockFits(inconsistent,1305600000) && latch(unread,inconsistent).status==Status::Unavailable && !unread.elapsed);
+        assert(clockFits(s,1305600000) && clockFits(s,621421874) && !clockFits(s,621421873));
+        auto above=s;above.pipeTimingHz=310710938;above.pipeLineTime=pipeLineTime(dp.htotal,above.pipeTimingHz);
+        assert(!clockFits(above,1305600000));
+        auto far=s;far.pipePixelHz=2209499999ULL;assert(clockFits(far,4419000000ULL));
+        far.pipePixelHz=2209500000ULL;assert(!clockFits(far,4419000000ULL));
+    }
     LatchIO clockChanged(p);clockChanged.changeClock=true;
     assert(latch(clockChanged,clockChanged.snapshot(p)).status==Status::Conflict);
     LatchIO autonomous(p);autonomous.regs[0x70B08]=1;

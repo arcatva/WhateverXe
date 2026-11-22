@@ -4676,6 +4676,9 @@ struct Display13FBPipeContext {
     Display13WM::Latch wmLatch;
     uint32_t wmPending {},wmSurface[2] {};
     bool wm0Only[2] {};
+    // Line time the pipe calculation last produced for this pipe; the latch
+    // proof checks PIPE_WM_LINETIME against it, not against the downscaled rate.
+    Display13WM::PipeTiming pipeTiming;
     // Zero until a real surface/WM retirement at the current display clock.
     uint64_t watermarkClockHz {};
 };
@@ -9597,6 +9600,9 @@ void XE::wrapAlderLakeNPipeWMSetup(IOService *controller,IOService *fb,OSObject 
 		const auto pixel=adjust(controller,fb,path,true,crtc);
 		const auto value=Display13WM::pipeLineTime(htotal,pixel);
 		*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(crtc)+0x84)=value;
+		// With a CRTC this rate carries no pipe-scaler downscale, unlike the
+		// null form the latch proof reads later. Keep what is programmed.
+		c.pipe[Display13FBMemory::field<uint32_t>(path,0x3640)].pipeTiming={htotal,value,pixel};
 		if(!value)adlnFault(c.watermarkFaulted,__LINE__);
 		record[1]=value;record[2]=htotal;record[3]=pixel;record[4]=params!=nullptr;
 	} else adlnFault(c.watermarkFaulted,__LINE__);
@@ -9808,10 +9814,13 @@ Display13WM::Latch XE::adlnVerifyWMLatch(IOService *fb,uint64_t nativeHz,uint64_
     const auto primaryRaw=Display13DBUF::hardwareRaw(c.dbuf,pipe,c.dbuf.pipe[pipe].primary);
     const auto cursorRaw=Display13DBUF::hardwareRaw(c.dbuf,pipe,c.dbuf.pipe[pipe].cursor);
     if(primaryRaw==UINT32_MAX || cursorRaw==UINT32_MAX) {result.status=Display13WM::Status::Input;return result;}
+	// pipePixel includes a pipe-scaler downscale; the programmed line time
+	// does not. Expect the value wrapAlderLakeNPipeWMSetup produced.
+	const auto timingHz=Display13WM::pipeTimingHz(c.pipe[pipe].pipeTiming,c.pipe[pipe].wm[0].htotal,pipePixel);
 	const Display13WM::Snapshot expected {
 		&c.pipe[pipe].wm[0],&c.pipe[pipe].wm[1],primaryRaw,cursorRaw,
 		c.pipe[pipe].wmSurface[0],c.pipe[pipe].wmSurface[1],readout.read(0x45004),nativeHz,c.pipe[pipe].wm0Only[0],cursor,
-		Display13WM::pipeLineTime(c.pipe[pipe].wm[0].htotal,pipePixel),pipePixel,pipe,c.transcoders
+		Display13WM::pipeLineTime(c.pipe[pipe].wm[0].htotal,timingHz),pipePixel,pipe,c.transcoders,timingHz
 	};
 	if(!Display13WM::clockFits(expected,targetHz)) {result.status=Display13WM::Status::Input;return result;}
 	return Display13WM::latch(io,expected);

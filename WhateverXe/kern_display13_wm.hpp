@@ -240,6 +240,25 @@ template<class IO> Program program(IO &io,const Plan &p,bool cursor,bool wm0Only
     }
     r.status=Status::Complete;return r;
 }
+// The pipe calculation derives PIPE_WM_LINETIME from the transcoder's own
+// pixel clock. A pipe-scaler downscale raises the rate the planes and the
+// display clock must carry, but not that register: an ADL-P eDP 2560x1440
+// panel (htotal 2720, 245.5MHz) scanning a 2880x1620 or 3072x1728 source
+// holds 0x59 while its downscaled pipe rate is 310.7 or 353.5MHz. This is
+// what the pipe calculation last produced for one pipe.
+struct PipeTiming {
+    uint32_t htotal {},lineTime {};
+    uint64_t hz {};
+};
+// Rate the programmed line time and the frame period follow. The record is
+// used only while it describes this transcoder, is its own line time, and
+// explains the current pipe rate as a downscale the scaler can reach. No
+// record, another htotal, a rate above the pipe's (a smaller source never
+// lowers the rate) or a ratio of nine or more keep the unscaled rule.
+inline uint64_t pipeTimingHz(const PipeTiming &t,uint32_t htotal,uint64_t pipePixelHz) {
+    return t.hz && t.htotal==htotal && t.lineTime && t.lineTime==pipeLineTime(t.htotal,t.hz) &&
+        t.hz<=pipePixelHz && pipePixelHz/9<t.hz ? t.hz : pipePixelHz;
+}
 struct Snapshot {
     const Plan *primary {},*cursor {};
     uint32_t primaryDDB {},cursorDDB {},primarySurface {},cursorSurface {},ipc {};
@@ -249,7 +268,11 @@ struct Snapshot {
     uint64_t pipePixelHz {};
     unsigned pipeIndex {}; // Display pipe, not physical HDMI DDI or framebuffer index.
     Display13Transcoder::Bindings transcoders;
+    // Transcoder pixel clock when a pipe downscale makes it differ from
+    // pipePixelHz; zero means the two are the same rate.
+    uint64_t pipeTimingHz {};
 };
+inline uint64_t timingHz(const Snapshot &s) {return s.pipeTimingHz ? s.pipeTimingHz : s.pipePixelHz;}
 // FlushTriggerPackets writes these native packets in append order. A flip
 // queued after WM enable may supersede the surface sampled at enable time.
 // Take intent before the flush; never turn the post-flush MMIO value into proof.
@@ -291,10 +314,14 @@ inline TriggerSurfaces triggerSurfaces(const TriggerPacket *packets,uint32_t cou
 // These linear RGB/cursor WM and PIPE_WM_LINETIME equations do not consume
 // CDCLK. An unchanged hardware-verified plan is valid at another clock when
 // every consumer still fits its bandwidth. A clock request alone is no proof.
+// Bandwidth is judged by the downscaled pipe rate, line time by the
+// transcoder rate; the latter never exceeds the former.
 inline bool clockFits(const Snapshot &s,uint64_t nativeHz) {
+    const auto timing=timingHz(s);
     return s.primary && s.primary->status==Status::Complete && nativeHz &&
         s.primary->pixelHz && s.primary->pixelHz<=nativeHz/2 && s.pipePixelHz &&
-        s.pipePixelHz<=nativeHz/2 && s.pipeLineTime==pipeLineTime(s.primary->htotal,s.pipePixelHz) &&
+        s.pipePixelHz<=nativeHz/2 && timing<=s.pipePixelHz && s.pipePixelHz/9<timing &&
+        s.pipeLineTime==pipeLineTime(s.primary->htotal,timing) &&
         (!s.cursorActive || (s.cursor && s.cursor->status==Status::Complete &&
             s.cursor->pixelHz && s.cursor->pixelHz<=nativeHz/2));
 }
@@ -344,7 +371,7 @@ template<class IO> Latch latch(IO &io,const Snapshot &s) {
     const auto ht=io.read(timing),vt=io.read(timing+0xC);
     const auto htotal=((ht>>16)&0x3FFF)+1,vtotal=((vt>>16)&0x3FFF)+1;
     if(ht==UINT32_MAX || vt==UINT32_MAX || htotal!=s.primary->htotal || !s.primary->height || s.primary->height>8192 || sourceExceedsScaler(s.primary->height,vtotal) || !s.primary->pixelHz) {r.status=Status::Input;return r;}
-    const auto period=ceilDiv(uint64_t(htotal)*vtotal*1000000,s.pipePixelHz);
+    const auto period=ceilDiv(uint64_t(htotal)*vtotal*1000000,timingHz(s));
     if(period<1000 || period>100000) {r.status=Status::Input;return r;}
     r.budgetUs=static_cast<uint32_t>(3*period+1000);
     r.frameBefore=io.read(0x70040+bank);

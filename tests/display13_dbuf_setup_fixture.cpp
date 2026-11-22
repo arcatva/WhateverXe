@@ -36,6 +36,7 @@ namespace Display13FBTopology {bool multiOutputWiring(unsigned w){return w!=0;}b
 struct Pipe {
  IOService *memoryFramebuffer{};bool destroyingPath{},wmProgramming{},wmCommitting{};
  unsigned wmPending{};uint64_t watermarkClockHz{};Display13WM::Plan wmProgram[2];Display13WM::Latch wmLatch;
+ Display13WM::PipeTiming pipeTiming;
 };
 struct Power {
  int *lock{};IOService *controller{};Map *map{};void *power{};
@@ -180,5 +181,50 @@ int main(){
   if(fault==5)badBinding=true;
   XE::adlnSetupDBUFPipe(c.controller,(IOService*)fb[0],0,false);assert(c.dbuf.faulted);
  }
- assert(!ownerDepth&&!fbDepth);puts("production DBUF setup: deferred retirement and failure guards passed");
+ // PIPE_WM_LINETIME, production pipe calculation to the latch proof's input.
+ // Contract and basis: the pipe calculation passes a CRTC to the native rate
+ // routine and programs the transcoder's own line time. On an ADL-P eDP
+ // 2560x1440 panel (htotal 2720, 245.5MHz) scanning a 2880x1620 source it
+ // recorded 0x59 and PIPE_WM_LINETIME read back 0x59, while the null-CRTC
+ // form the latch proof calls returned the downscaled 310710937Hz, i.e.
+ // 0x47, and the proof faulted on a value that scans out without underrun.
+ // The proof therefore takes its line time from what this writer kept.
+ // Counterexamples: the pending CRTC, not the path's, decides when supplied;
+ // only the path's own pipe is recorded; a record for another htotal, above
+ // the pipe rate, or nine times below it leaves the unscaled rule in force.
+ // Limits: adlnVerifyWMLatch itself is not executed here; the rate routine
+ // is modeled from those two observed returns.
+ {
+  static unsigned crtcCalls,nullCalls;
+  struct Rate {static uint64_t adjust(void*,void*,void*,bool pipe,void *crtc){assert(pipe);++(crtc?crtcCalls:nullCalls);return crtc?245500000:310710937;}};
+  alignas(16) static uint8_t port[0x580],scaler[0x58],pending[0x100];static uint32_t config[8];
+  for(unsigned p:{0U,2U})for(bool withParams:{false,true}){
+   Map map;setup(map);auto &c=display13FBPower;crtcCalls=nullCalls=0;
+   memset(port,0,sizeof(port));memset(scaler,0,sizeof(scaler));memset(pending,0,sizeof(pending));
+   ((OSObject*)ctl)->size=sizeof(ctl);((OSObject*)paths[p])->size=sizeof(paths[p]);
+   ((OSObject*)port)->size=sizeof(port);((OSObject*)scaler)->size=sizeof(scaler);
+   put(fb[p],0x1D0,c.controller);put(paths[p],0x32B0,(IOService*)fb[p]);put(paths[p],0x3640,uint32_t(p));
+   put(paths[p],0x3648,(OSObject*)port);put(port,0x548,(uint32_t*)config);put(paths[p],0x32C0,(OSObject*)scaler);
+   put(paths[p],0x128+0x10,uint32_t((2199U<<16)|1919));put(pending,0x10,uint32_t((2719U<<16)|2559));
+   state.adlnAdjustPixelClock=(uintptr_t)Rate::adjust;
+   uint8_t *crtc=withParams?pending:paths[p]+0x128;
+   IORecursiveLockLock(&frameMutex);XE::wrapAlderLakeNPipeWMSetup(c.controller,(IOService*)fb[p],(OSObject*)paths[p],withParams?pending:nullptr);IORecursiveLockUnlock(&frameMutex);
+   // ceil(2720*8e6/245.5e6)=89 for the pending CRTC, ceil(2200*8e6/245.5e6)=72 for the path's.
+   const uint32_t ht=withParams?2720:2200,lt=withParams?89:72;
+   assert(!c.watermarkFaulted && crtcCalls==1 && !nullCalls && Display13FBMemory::field<uint32_t>(crtc,0x84)==lt);
+   const auto &t=c.pipe[p].pipeTiming;
+   assert(t.htotal==ht && t.lineTime==lt && t.hz==245500000);
+   for(unsigned other=0;other<3;++other)if(other!=p)assert(!c.pipe[other].pipeTiming.hz && !c.pipe[other].pipeTiming.lineTime);
+   // The proof's selection, applied to the null-form rates seen for 2880x1620 and 3072x1728 sources.
+   for(uint64_t pipeHz:{310710937ULL,353520000ULL,245500000ULL}) {
+    const auto hz=Display13WM::pipeTimingHz(t,ht,pipeHz);
+    assert(hz==245500000 && Display13WM::pipeLineTime(ht,hz)==lt);
+   }
+   assert(Display13WM::pipeTimingHz(t,ht+1,310710937)==310710937);
+   assert(Display13WM::pipeTimingHz(t,ht,196400000)==196400000);
+   assert(Display13WM::pipeTimingHz(t,ht,245500000ULL*9)==245500000ULL*9);
+   assert(!ownerDepth && !fbDepth);
+  }
+ }
+ assert(!ownerDepth&&!fbDepth);puts("production DBUF setup: deferred retirement and failure guards passed; pipe line time is kept per pipe from the CRTC the pipe calculation used");
 }

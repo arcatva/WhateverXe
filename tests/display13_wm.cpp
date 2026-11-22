@@ -177,6 +177,11 @@ int main() {
     const auto yLong=yTiledLevel(1920,2200,148500000,147,642);
     assert(yLong.enable && yLong.blocks==154 && yLong.lines==10 && yLong.minimum==245);
     assert(!yTiledLevel(1920,2200,148500000,3,122).enable);
+    // Downscaled source (HiDPI 2880 wide through a pipe with htotal 2720, plane rate = 245.5 MHz * 1.125^2):
+    // tile blocks 91, 22.75 blocks per line, four-line minimum 91 -> 92 blocks, (4+4) lines -> 182 -> 183.
+    const auto yDown=yTiledLevel(2880,2720,310710937,3,2008);
+    assert(yDown.enable && yDown.blocks==92 && yDown.lines==4 && yDown.minimum==183);
+    assert(!yTiledLevel(1920,640,148500000,3,2008).enable); // Three times the pipe total: no scaler reaches it.
     const auto yt=transition(y0,642,true,61);
     assert(yt.enable && yt.blocks==137 && yt.minimum==138);
     assert(pipeLineTime(2200,148500000)==119); // Donor's truncation produced118.
@@ -469,7 +474,13 @@ int main() {
     assert(!linearLevel(1920,2200,148500000,5000,4096).enable);
     assert(linearLevel(64,100,10000000,3,100).blocks==3); // Both byte counts below one block select method2.
     assert(!linearLevel(0,2200,148500000,3,2008).enable);
-    assert(!linearLevel(1920,1900,148500000,3,2008).enable);
+    // A source wider than htotal is valid when the pipe scaler downscales it; 1920 over 1900 is such a case
+    // (bytes per line 16 -> blocks 16, minimum 16+2+1). The rejection that remains is a ratio of three or more.
+    const auto slight=linearLevel(1920,1900,148500000,3,2008);
+    assert(slight.enable && slight.blocks==16 && slight.lines==1 && slight.minimum==19);
+    const auto down=linearLevel(2880,2720,310710937,3,2008);
+    assert(down.enable && down.blocks==24 && down.lines==1 && down.minimum==28);
+    assert(!linearLevel(1920,640,148500000,3,2008).enable);
     assert(!linearLevel(1920,2200,0,3,2008).enable);
     // All supported arithmetic remains bounded even at maximum PCODE block time.
     assert(!linearLevel(16384,16384,2000000000ULL,65793,4096).enable);
